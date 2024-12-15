@@ -9,7 +9,7 @@ This repository hosts a Bluesky bot that performs astrometry on images mentioned
 Installation
 
     Clone this repository.
-    Install the required Python packages. Based on the previously provided source code, the following should suffice:
+    Install the required Python packages. 
 
     pip install requests pillow atproto
 
