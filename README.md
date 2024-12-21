@@ -26,25 +26,30 @@ The bot will reply with :
 
 ## Configuration
 
-You need to create a credentials.py file at the root of the project. This file should contain a dictionary with your bot’s credentials and API key. For example:
+You need to create a `credentials.py` file at the root of the project. This file should contain a dictionary with your bot’s credentials and API key. For example:
 
+```python
 credentials = {
     "botname": "your-bot-name",
     "BLUESKY_USERNAME": "your-bot-username.bsky.social",
     "BLUESKY_PASSWORD": "your-bluesky-password",
     "API_KEY": "your-astrometry-api-key"
 }
+```
 
-Important: Do not commit this credentials.py file to the repository, as it contains sensitive information. The .gitignore is configured to exclude it by default.
-Usage
+# Run the bot
 
-    Run the bot:
+### One shot
+```bash
+python bot.py
+```
 
-    python main.py
+### From cron task (example: every 5 minutes)
+This script avoids re-entrance and relaunches the bot in case of a crash:
+```bash
+run_astrometry.sh
+```
 
-    The bot will listen for mentions on Bluesky, download attached images, run astrometry via nova.astrometry.net, and post a reply with the results.
+The bot will listen for mentions on Bluesky, download attached images, run astrometry via nova.astrometry.net, and post a reply with the results.
 
-Notes
 
-    Ensure that credentials.py and .gitignore are properly set up before running the bot.
-    The results directory will store any intermediate or downloaded images. If you want to ensure this directory is tracked even when empty, you may place a .gitkeep file inside it.
