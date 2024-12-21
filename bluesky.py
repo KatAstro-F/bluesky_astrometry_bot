@@ -111,6 +111,7 @@ class bluesky():
             if notification['uri'] in self.processed_notifications:
                 continue
 
+
             # Mark notification as processed
             self.processed_notifications.add(notification['uri'])
             self.save_processed_notifications()
@@ -127,9 +128,36 @@ class bluesky():
                 if self.botname in post_text.lower():
                     self.logger.info(f"Bot was tagged in a post: {post_text}")
 
+                    if not (hasattr(post_content, 'embed') and post_content.embed):
+                        try:
+                            #check if the post is a comment from a parent post
+                            if post_thread['thread']['parent'] is None :
+                                return None
+                            #check if the comment author is the  original post author to avoid spam
+                            if post["author"]["handle"]==post_thread['thread']['parent']['post']["author"]["handle"]:
+                                post = post_thread['thread']['parent']['post']
+                                post_content = post['record']
+                            else:
+                                return None
+                        except Exception as e:
+                            # Log errors if unable to create the post
+                            self.logger.error("Error finding parent post: %s", e)
+                            return None
+
                     # Check if there is an embed with images
                     if hasattr(post_content, 'embed') and post_content.embed:
+                        
                         embed = post_content.embed
+                        #if not image in the post try to get the image in the quoted post
+                        if not(hasattr(embed, 'images') and embed.images):
+                            try:
+                                quoted_thread=self.client.app.bsky.feed.get_post_thread({'uri':embed["record"]["uri"] })
+                                embed=quoted_thread['thread']['post']['record'].embed
+                            except Exception as e:
+                                # Log errors if unable to create the post
+                                self.logger.error("Error finding image in quoted post: %s", e)
+                                return None
+
                         if hasattr(embed, 'images') and embed.images:
                             images = embed.images
                             if images:
