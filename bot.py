@@ -42,7 +42,17 @@ if __name__ == "__main__":
             continue
 
         # Log into astrometry.net before performing astrometry on the image
-        astro.login_astrometry()
+        #added retry on fail, if astrometry server is down
+        while (True):
+            try:
+                astro.login_astrometry()
+                break
+            except:
+                #astrometry server is down, just wait
+                time.sleep(120)
+
+
+
 
         try:
             # Perform astrometry on the downloaded image and get results and annotated images

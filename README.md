@@ -4,12 +4,12 @@ This repository hosts a Bluesky bot that performs astrometry on images mentioned
 
 ## Features
 
+Based on this image
+
+<img src="https://github.com/KatAstro-F/bluesky_astrometry_bot/blob/main/ressources/test-image.jpg" alt="test image Bubble Nebula" width="25%">
+
 1. **Annotated Image**: The bot generates an annotated image highlighting detected celestial objects.
-    
-    <img src="https://github.com/KatAstro-F/bluesky_astrometry_bot/blob/main/ressources/test-image.jpg" alt="test image Bubble Nebula" width="25%">
-
-    Example reply:
-
+       
     <img src="https://github.com/KatAstro-F/bluesky_astrometry_bot/blob/main/ressources/12213519_annotated_full.png" alt="Annotated image" width="25%">
 
 2. **List of Objects Found**: Provides a list of objects detected in the field.

@@ -81,13 +81,16 @@ class bluesky():
         }
         return image_blob_ref
 
-    def download_image(self, author_did, cid, save_path='results/downloaded_image.jpg'):
+    def download_image(self, author_did, cid, alt_link,save_path='results/downloaded_image.jpg'):
         # Download an image from Bluesky CDN using the author's DID and CID of the image
         try:
             image_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}"
             headers = {'User-Agent': 'YourBotName/1.0'}
             response = requests.get(image_url, headers=headers)
-            if response.status_code == 200:
+            if not response.status_code == 200:
+                #some link are indirect try alt link in case of failure
+                response = requests.get(alt_link, headers=headers)
+            if  response.status_code == 200:
                 # Save the downloaded image locally
                 with open(save_path, 'wb') as file:
                     file.write(response.content)
@@ -110,7 +113,7 @@ class bluesky():
             # Skip if notification already processed
             if notification['uri'] in self.processed_notifications:
                 continue
-
+                #pass
 
             # Mark notification as processed
             self.processed_notifications.add(notification['uri'])
@@ -127,7 +130,7 @@ class bluesky():
                 # Check if the bot is mentioned in the post text
                 if self.botname in post_text.lower():
                     self.logger.info(f"Bot was tagged in a post: {post_text}")
-
+                    alt_link=None
                     if not (hasattr(post_content, 'embed') and post_content.embed):
                         try:
                             #check if the post is a comment from a parent post
@@ -153,11 +156,19 @@ class bluesky():
                             try:
                                 quoted_thread=self.client.app.bsky.feed.get_post_thread({'uri':embed["record"]["uri"] })
                                 embed=quoted_thread['thread']['post']['record'].embed
+                                alt_link=quoted_thread['thread']['post']['embed']['images'][0]["fullsize"]
                             except Exception as e:
                                 # Log errors if unable to create the post
                                 self.logger.error("Error finding image in quoted post: %s", e)
                                 return None
-
+                        else:
+                            try:
+                                alt_link=post['embed']['images'][0]["fullsize"]
+                            except Exception as e:
+                                # Log errors if unable to create the post
+                                self.logger.error("Error finding image in quoted post: %s", e)
+                                return None
+                            
                         if hasattr(embed, 'images') and embed.images:
                             images = embed.images
                             if images:
@@ -166,20 +177,32 @@ class bluesky():
                                 # Get the author's DID
                                 author_did = post['author']['did']
                                 # Download the image
-                                downloaded_image_path = self.download_image(author_did, image_cid)
+                                downloaded_image_path = self.download_image(author_did, image_cid,alt_link)
 
                                 # Get root and parent URIs and CIDs for reply
-                                root_uri = post['uri']
-                                root_cid = post['cid']
+                                root_uri = post["uri"]
+                                root_cid = post["cid"]
 
-                                if 'parent' in post_thread['thread'] and post_thread['thread']['parent']:
+                                # Correct the problem of orphan post when replying to a comment of a root post
+                                if hasattr(post["record"], "reply") and post["record"].reply:
+                                    reply_ref = post["record"].reply
+                                    if hasattr(reply_ref, "root") and reply_ref.root:
+                                        root_uri = reply_ref.root.uri
+                                        root_cid = reply_ref.root.cid
+
+                                # The key: always attach to *this* post (child) so your reply is not orphaned
+                                parent_uri = post["uri"]
+                                parent_cid = post["cid"]
+                                
+                                """
+                                if hasattr(post_thread['thread'],'parent') and post_thread['thread']['parent']:
                                     parent_post = post_thread['thread']['parent']['post']
                                     parent_uri = parent_post['uri']
                                     parent_cid = parent_post['cid']
                                 else:
                                     parent_uri = root_uri
                                     parent_cid = root_cid
-
+                                """
                                 # Construct a dictionary with post IDs for replying
                                 post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
                                 return post_id, downloaded_image_path

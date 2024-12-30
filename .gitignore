@@ -1,0 +1,27 @@
+!.gitignore
+
+# 2) Ignore everything by default
+*
+
+# 3) (Optional) Whitelist specific file types in root, if needed
+!*.py
+!*.sh
+!*.txt
+
+# 4) Ignore all directories
+*/
+
+# 5) Handle the "results" directory:
+#    - First allow only the directory itself...
+!results/
+#    - ...but ignore every file inside "results"
+results/*
+#    - ...except for .gitkeep (to keep it empty but tracked)
+!results/.gitkeep
+
+# 6) Whitelist the entire "ressources" directory
+!ressources/
+!ressources/**
+
+# 1) Do not track credentials.py
+/credentials.py
