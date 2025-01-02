@@ -272,3 +272,33 @@ class bluesky():
             # Log errors if unable to create the post
             self.logger.error("Error creating post: %s", e)
             self.logger.error("Record being sent: %s", record)
+
+
+    def repost_original_post(self, uri, cid):
+        """
+        Repost the original post on the bot feed.
+        - uri: The unique at:// URI of the post to repost
+        - cid: The content ID (CID) of the post
+        """
+        # Construct a record of type 'app.bsky.feed.repost'
+        repost_record = {
+            "$type": "app.bsky.feed.repost",
+            "subject": {
+                "uri": uri,
+                "cid": cid
+            },
+            # 'createdAt' is required for repost
+            "createdAt": datetime.utcnow().isoformat() + 'Z'
+        }
+
+        try:
+            # Use the create_record API to create a repost
+            self.client.com.atproto.repo.create_record({
+                'repo': self.client.me.did,
+                'collection': 'app.bsky.feed.repost',
+                'record': repost_record
+            })
+            self.logger.info(f"Reposted the post with URI: {uri}")
+        except Exception as e:
+            self.logger.error("Error creating repost: %s", e)
+            self.logger.error("Record being sent: %s", repost_record)

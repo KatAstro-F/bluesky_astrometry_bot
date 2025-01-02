@@ -83,3 +83,4 @@ if __name__ == "__main__":
 
         # Post a reply with the images and the generated text
         bs.post_reply(images_list, reply_text, post_id)
+        bs.repost_original_post(post_id["parent_uri"],post_id["parent_cid"])
