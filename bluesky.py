@@ -31,38 +31,6 @@ class bluesky():
         with open(self.PROCESSED_NOTIFICATIONS_FILE, 'w') as f:
             json.dump(list(self.processed_notifications), f)
 
-
-    def reply_with_text_only(self, post_id, text):
-        # Reply to a post with text only (no images)
-        record = {
-            "$type": "app.bsky.feed.post",
-            "text": text,
-            "createdAt": datetime.utcnow().isoformat() + 'Z',
-            "reply": {
-                "root": {
-                    "uri": post_id["root_uri"],
-                    "cid": post_id["root_cid"]
-                },
-                "parent": {
-                    "uri": post_id["parent_uri"],
-                    "cid": post_id["parent_uri"]
-                }
-            }
-        }
-
-        # Attempt to create a text-only reply post
-        try:
-            self.client.com.atproto.repo.create_record({
-                'repo': self.client.me.did,
-                'collection': 'app.bsky.feed.post',
-                'record': record
-            })
-            self.logger.info("Replied with astrometry failed message.")
-        except Exception as e:
-            # Log errors if the post could not be created
-            self.logger.error("Error creating text-only post: %s", e)
-            self.logger.error("Record being sent: %s", record)
-
     def upload_and_create_image_blob(self,image_path):
         # Upload an image to Bluesky and create a blob reference
         with open(image_path, 'rb') as f:
@@ -109,6 +77,7 @@ class bluesky():
     def Check_valid_notifications(self):
         # Check notifications and return valid mentions with images
         notifications = self.client.app.bsky.notification.list_notifications()['notifications']
+        #image_cid=None
         for notification in notifications:
             # Skip if notification already processed
             if notification['uri'] in self.processed_notifications:
@@ -127,6 +96,16 @@ class bluesky():
                 post_content = post['record']
                 post_text = post_content.text
 
+                # Get root and parent URIs and CIDs for reply 
+                root_uri = post["uri"]
+                root_cid = post["cid"]
+                # The key: always attach to *this* post (child) so your reply is not orphaned
+                parent_uri = post["uri"]
+                parent_cid = post["cid"]
+                
+                # Construct a dictionary with post IDs for replying
+                post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
+
                 # Check if the bot is mentioned in the post text
                 if self.botname in post_text.lower():
                     self.logger.info(f"Bot was tagged in a post: {post_text}")
@@ -135,53 +114,64 @@ class bluesky():
                         try:
                             #check if the post is a comment from a parent post
                             if post_thread['thread']['parent'] is None :
-                                return None
+                                return post_id,None
                             #check if the comment author is the  original post author to avoid spam
                             if post["author"]["handle"]==post_thread['thread']['parent']['post']["author"]["handle"]:
                                 post = post_thread['thread']['parent']['post']
                                 post_content = post['record']
                             else:
-                                return None
+                                return post_id,None
                         except Exception as e:
                             # Log errors if unable to create the post
                             self.logger.error("Error finding parent post: %s", e)
-                            return None
+                            return post_id,None
 
                     # Check if there is an embed with images
                     if hasattr(post_content, 'embed') and post_content.embed:
                         
                         embed = post_content.embed
-                        #if not image in the post try to get the image in the quoted post
                         if not(hasattr(embed, 'images') and embed.images):
-                            try:
-                                quoted_thread=self.client.app.bsky.feed.get_post_thread({'uri':embed["record"]["uri"] })
-                                embed=quoted_thread['thread']['post']['record'].embed
-                                alt_link=quoted_thread['thread']['post']['embed']['images'][0]["fullsize"]
-                            except Exception as e:
-                                # Log errors if unable to create the post
-                                self.logger.error("Error finding image in quoted post: %s", e)
-                                return None
+                            #handle case where images is embedded together with a quoted post (pffff)
+                            if (hasattr(embed, 'media') and hasattr(embed.media, 'images')) and embed.media.images:   
+                                #image_cid=embed.media.images[0].image.ref.link 
+                                embed=embed.media
+                                alt_link=None
+                            else:     
+                                try:
+                                    #if not image in the post try to get the image in the quoted post
+                                    quoted_thread=self.client.app.bsky.feed.get_post_thread({'uri':embed["record"]["uri"] })
+                                    embed=quoted_thread['thread']['post']['record'].embed
+                                    if (hasattr(quoted_thread['thread']['post']['embed'], 'images') and quoted_thread['thread']['post']['embed'].images):
+                                        alt_link=quoted_thread['thread']['post']['embed']['images'][0]["fullsize"]
+                                    else:
+                                        embed=quoted_thread['thread']['post']['embed'].media
+                                        alt_link=embed.images[0].fullsize
+                                        
+                                except Exception as e:
+                                    # Log errors if unable to create the post
+                                    self.logger.error("Error finding image in quoted post: %s", e)
+                                    return post_id,None
                         else:
                             try:
                                 alt_link=post['embed']['images'][0]["fullsize"]
                             except Exception as e:
                                 # Log errors if unable to create the post
                                 self.logger.error("Error finding image in quoted post: %s", e)
-                                return None
+                                return post_id,None
                             
                         if hasattr(embed, 'images') and embed.images:
                             images = embed.images
-                            if images:
-                                # Get the CID of the first image
-                                image_cid = images[0].image.ref.link
+                            if images: 
+                                # Get the CID of the first image 
+                                #if image_cid is None:
+                                if hasattr(embed.images[0],"image"):
+                                    image_cid = images[0].image.ref.link
+                                else:
+                                    image_cid=""
                                 # Get the author's DID
                                 author_did = post['author']['did']
                                 # Download the image
                                 downloaded_image_path = self.download_image(author_did, image_cid,alt_link)
-
-                                # Get root and parent URIs and CIDs for reply
-                                root_uri = post["uri"]
-                                root_cid = post["cid"]
 
                                 # Correct the problem of orphan post when replying to a comment of a root post
                                 if hasattr(post["record"], "reply") and post["record"].reply:
@@ -189,20 +179,7 @@ class bluesky():
                                     if hasattr(reply_ref, "root") and reply_ref.root:
                                         root_uri = reply_ref.root.uri
                                         root_cid = reply_ref.root.cid
-
-                                # The key: always attach to *this* post (child) so your reply is not orphaned
-                                parent_uri = post["uri"]
-                                parent_cid = post["cid"]
                                 
-                                """
-                                if hasattr(post_thread['thread'],'parent') and post_thread['thread']['parent']:
-                                    parent_post = post_thread['thread']['parent']['post']
-                                    parent_uri = parent_post['uri']
-                                    parent_cid = parent_post['cid']
-                                else:
-                                    parent_uri = root_uri
-                                    parent_cid = root_cid
-                                """
                                 # Construct a dictionary with post IDs for replying
                                 post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
                                 return post_id, downloaded_image_path
@@ -220,6 +197,8 @@ class bluesky():
                     "image": image_blob_ref,
                     "alt": image[1]
                 })
+
+        facets = self.add_mention_facets(post_text)
 
         # Construct the record for embedding images if available
         if image_embeds:
@@ -260,6 +239,9 @@ class bluesky():
                 }
             }
 
+        if facets:
+            record["facets"] = facets
+
         # Try to create the reply post
         try:
             self.client.com.atproto.repo.create_record({
@@ -272,6 +254,32 @@ class bluesky():
             # Log errors if unable to create the post
             self.logger.error("Error creating post: %s", e)
             self.logger.error("Record being sent: %s", record)
+
+
+    def add_mention_facets(self,post_text,mention_str="@quantumkat.bsky.social",mention_did="did:plc:bqvcty4gfx5s2b4gvlff6ikp"):
+        """
+        Returns a 'facets' list if the mention_str is found in post_text.
+        mention_str should include '@' (e.g. '@quantumkat.bsky.social').
+        """
+        start_index = post_text.find(mention_str)
+        if start_index == -1:
+            return None  # Not found, so no facets to return
+
+        end_index = start_index + len(mention_str)
+
+        # Build the facets structure for a mention
+        facets = [{
+            "index": {
+                "byteStart": start_index,
+                "byteEnd": end_index
+            },
+            "features": [{
+                "$type": "app.bsky.richtext.facet#mention",
+                "did": mention_did
+            }]
+        }]
+
+        return facets
 
 
     def repost_original_post(self, uri, cid):

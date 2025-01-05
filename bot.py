@@ -39,6 +39,8 @@ if __name__ == "__main__":
 
         # If no image was downloaded, continue looping
         if not image_path:
+            fail_message = "image extraction failed. @quantumkat.bsky.social"
+            bs.post_reply({}, fail_message, post_id)
             continue
 
         # Log into astrometry.net before performing astrometry on the image
@@ -62,8 +64,8 @@ if __name__ == "__main__":
             # If an error occurs during astrometry, log it
             logger.error("Error performing astrometry: %s", e)
             # Reply to the user indicating that astrometry failed
-            fail_message = "Astrometry failed. Please try another image."
-            bs.reply_with_text_only(post_id, fail_message)
+            fail_message = "Astrometry failed. @quantumkat.bsky.social"
+            bs.post_reply({}, fail_message, post_id)            
             # Continue to the next iteration of the loop
             continue
 
