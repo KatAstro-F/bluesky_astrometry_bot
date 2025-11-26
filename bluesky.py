@@ -95,6 +95,7 @@ class bluesky():
                 post = post_thread['thread']['post']
                 post_content = post['record']
                 post_text = post_content.text
+                mention_record = post_content  # MODIFIED (B fix): keep the original mention's record
 
                 # Get root and parent URIs and CIDs for reply 
                 root_uri = post["uri"]
@@ -174,8 +175,10 @@ class bluesky():
                                 downloaded_image_path = self.download_image(author_did, image_cid,alt_link)
 
                                 # Correct the problem of orphan post when replying to a comment of a root post
-                                if hasattr(post["record"], "reply") and post["record"].reply:
-                                    reply_ref = post["record"].reply
+                                # MODIFIED (B fix): compute root from the ORIGINAL mention's record,
+                                # not from `post` which may have been switched to the parent to fetch the image.
+                                if hasattr(mention_record, "reply") and mention_record.reply:
+                                    reply_ref = mention_record.reply
                                     if hasattr(reply_ref, "root") and reply_ref.root:
                                         root_uri = reply_ref.root.uri
                                         root_cid = reply_ref.root.cid

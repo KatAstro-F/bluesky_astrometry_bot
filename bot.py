@@ -31,9 +31,11 @@ if __name__ == "__main__":
         time.sleep(10)
         # Check for valid notifications (mentions with images)
         results = bs.Check_valid_notifications()
+
         # If no valid mentions, continue looping
         if results is None:
             continue
+        #continue
         # Extract the post_id and the image_path from the results
         post_id, image_path = results
 
@@ -83,6 +85,15 @@ if __name__ == "__main__":
             (skymap2_path, "Sky map - Zoom level 2"),
         ]
 
-        # Post a reply with the images and the generated text
-        bs.post_reply(images_list, reply_text, post_id)
-        bs.repost_original_post(post_id["parent_uri"],post_id["parent_cid"])
+        success=False
+        while not success:
+            try:
+                # Post a reply with the images and the generated text
+                bs.post_reply(images_list, reply_text, post_id)
+                bs.repost_original_post(post_id["parent_uri"],post_id["parent_cid"])
+                success=True
+                time.sleep(120)
+            except Exception as e:
+                logger.error("Error posting reply: %s", e)
+
+        
