@@ -1,8 +1,22 @@
 import os
+import re
+import time
+from urllib.parse import urljoin, urlparse
+from io import BytesIO
+from PIL import Image
 from atproto import Client
 import json
 from datetime import datetime
 import requests
+from credentials import credentials
+
+try:
+    # Optional: used only for high-res AstroBin downloads.
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+except ImportError:  # pragma: no cover - optional dependency
+    webdriver = None
+    ChromeOptions = None
 
 class bluesky():
 
@@ -73,6 +87,341 @@ class bluesky():
             self.logger.error(f"Error downloading image: {e}")
             return None
 
+    def _extract_astrobin_url(self, text):
+        """
+        Extract the first AstroBin URL from the given text.
+        Supports URLs with or without an explicit scheme.
+        """
+        if not text:
+            return None
+
+        # Match e.g. "https://www.astrobin.com/abcd12/0/",
+        # "astrobin.com/abcd12", "https://app.astrobin.com/i/edt08c", etc.
+        pattern = r'((?:https?://)?(?:[\w.-]+\.)?astrobin\.com/[^\s]+)'
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            return None
+
+        url = match.group(1)
+        # Strip common trailing punctuation
+        url = url.rstrip(').,;\'"')
+        if not url.lower().startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
+
+    def _extract_astrobin_hash(self, astrobin_url):
+        """
+        Extract the AstroBin image hash from a URL such as:
+          - https://app.astrobin.com/i/edt08c
+          - https://www.astrobin.com/edt08c/
+          - https://astrobin.com/edt08c/0/
+        """
+        try:
+            parsed = urlparse(astrobin_url)
+            parts = [p for p in parsed.path.split("/") if p]
+            if not parts:
+                return None
+            # Handle app-style URLs: /i/<hash>
+            if parts[0] == "i" and len(parts) >= 2:
+                return parts[1]
+            # Canonical web URLs: /<hash>/ or /<hash>/<version>/
+            return parts[0]
+        except Exception:
+            return None
+
+    def _download_astrobin_original(self, astrobin_url, headers, save_path):
+        """
+        Try AstroBin's public download mechanism to retrieve the original image
+        without using the API. This uses the canonical URL:
+          https://www.astrobin.com/<hash>/?download=1
+        and follows redirects until it reaches an image response.
+        """
+        astro_hash = self._extract_astrobin_hash(astrobin_url)
+        if not astro_hash:
+            return None
+
+        download_url = f"https://www.astrobin.com/{astro_hash}/?download=1"
+        try:
+            resp = requests.get(download_url, headers=headers, timeout=60, stream=True, allow_redirects=True)
+            ct = resp.headers.get("Content-Type", "")
+            if resp.status_code == 200 and ct.startswith("image/"):
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                try:
+                    img = Image.open(BytesIO(resp.content))
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    img.save(save_path, "JPEG", quality=90)
+                except Exception as e:
+                    self.logger.error(f"Failed to convert AstroBin original image to JPEG: {e}")
+                    return None
+
+                self.logger.info(f"Downloaded AstroBin original image from {resp.url} to {save_path}")
+                return save_path
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error using AstroBin download URL {download_url}: {e}")
+            return None
+
+    def _download_astrobin_via_selenium(self, astrobin_url, headers, save_path):
+        """
+        Use a real browser (Selenium + Chrome) to load the AstroBin page,
+        inspect all network resources, and pick the largest AstroBin image.
+
+        This mimics what your browser does when it loads the viewer, even if
+        the image itself is exposed via a blob: URL in the DOM.
+        """
+        if webdriver is None or ChromeOptions is None:
+            self.logger.warning("Selenium is not installed; cannot use browser-based AstroBin download.")
+            return None
+
+        try:
+            options = ChromeOptions()
+            # Headless to avoid opening a visible window.
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            ua = headers.get("User-Agent", "Mozilla/5.0")
+            options.add_argument(f"--user-agent={ua}")
+
+            driver = webdriver.Chrome(options=options)
+        except Exception as e:  # pragma: no cover - depends on local driver setup
+            self.logger.warning(f"Could not start Selenium Chrome driver: {e}")
+            return None
+
+        try:
+            driver.set_window_size(1920, 1080)
+            driver.get(astrobin_url)
+
+            # Give the page some time to load JS and images.
+            time.sleep(8)
+
+            try:
+                urls = driver.execute_script(
+                    "return (window.performance && performance.getEntriesByType) ? "
+                    "performance.getEntriesByType('resource').map(e => e.name) : [];"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not read performance entries via Selenium: {e}")
+                urls = []
+
+            if not urls:
+                return None
+
+            # Filter to candidate image URLs from AstroBin/CDN.
+            candidates = []
+            for url in urls:
+                if not isinstance(url, str):
+                    continue
+                lower = url.lower()
+                if "astrobin.com" not in lower:
+                    continue
+                if not any(ext in lower for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                    continue
+                if any(bad in lower for bad in ["avatar", "favicon", "logo", "apple-touch-icon"]):
+                    continue
+                candidates.append(url)
+
+            if not candidates:
+                self.logger.info("Selenium did not observe any suitable AstroBin image URLs.")
+                return None
+
+            best_img = None
+            best_pixels = -1
+
+            for url in candidates:
+                try:
+                    resp = requests.get(url, headers=headers, timeout=60)
+                    if resp.status_code != 200:
+                        continue
+                    img = Image.open(BytesIO(resp.content))
+                    w, h = img.size
+                    pixels = w * h
+                    if pixels > best_pixels:
+                        best_pixels = pixels
+                        best_img = img
+                except Exception:
+                    continue
+
+            if best_img is None:
+                return None
+
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            if best_img.mode != "RGB":
+                best_img = best_img.convert("RGB")
+            best_img.save(save_path, "JPEG", quality=90)
+            self.logger.info(
+                f"Downloaded AstroBin image via Selenium from {astrobin_url} to {save_path} "
+                f"({best_pixels} pixels)"
+            )
+            return save_path
+        finally:
+            driver.quit()
+
+    def download_astrobin_image(self, astrobin_url, save_path='results/downloaded_astrobin.jpg'):
+        """
+        Resolve an AstroBin page URL to its underlying image and download it.
+        Prefer the highest-resolution image available:
+          1) Try AstroBin's public download URL (?download=1) to get the
+             original image if publicly accessible.
+          2) Try Selenium (real browser) to discover the largest AstroBin
+             image requested by the page.
+          3) If AstroBin API credentials are configured, use the official API
+             to obtain the best url_* field (e.g., url_real or url_hd).
+          4) Otherwise, parse the HTML (srcset/OpenGraph/Twitter) as a fallback.
+        """
+        try:
+            headers = {'User-Agent': 'YourBotName/1.0'}
+
+            # --- 1) Try direct download of original image (no API needed) ---
+            original_path = self._download_astrobin_original(astrobin_url, headers, save_path)
+            if original_path:
+                return original_path
+
+            # --- 2) Try using Selenium to mimic a real browser and
+            #         discover the largest image used by the viewer.
+            selenium_path = self._download_astrobin_via_selenium(astrobin_url, headers, save_path)
+            if selenium_path:
+                return selenium_path
+
+            img_url = None
+
+            # --- 3) Try AstroBin API for full resolution (optional) ---
+            api_key = credentials.get("ASTROBIN_API_KEY")
+            api_secret = credentials.get("ASTROBIN_API_SECRET")
+            astro_hash = self._extract_astrobin_hash(astrobin_url)
+
+            if api_key and api_secret and astro_hash:
+                try:
+                    api_base = "https://www.astrobin.com/api/v1/image/"
+                    params = {
+                        "api_key": api_key,
+                        "api_secret": api_secret,
+                        "format": "json",
+                        "hash": astro_hash,
+                    }
+                    api_resp = requests.get(api_base, params=params, timeout=30)
+                    if api_resp.status_code == 200:
+                        data = api_resp.json()
+                        image_obj = None
+                        if isinstance(data, dict):
+                            if data.get("objects"):
+                                image_obj = data["objects"][0]
+                            elif data.get("results"):
+                                image_obj = data["results"][0]
+                            else:
+                                image_obj = data
+                        elif isinstance(data, list) and data:
+                            image_obj = data[0]
+
+                        if isinstance(image_obj, dict):
+                            url_keys = [
+                                "url_real",
+                                "url_hd",
+                                "url_regular",
+                                "url_gallery",
+                                "url_big",
+                                "url",
+                            ]
+                            for key in url_keys:
+                                candidate = image_obj.get(key)
+                                if candidate:
+                                    img_url = candidate
+                                    self.logger.info(f"Using AstroBin API {key} for hash {astro_hash}")
+                                    break
+                    else:
+                        self.logger.warning(f"AstroBin API request failed ({api_resp.status_code}) for hash {astro_hash}")
+                except Exception as e:
+                    self.logger.warning(f"Error using AstroBin API for {astrobin_url}: {e}")
+
+            # --- 4) Fallback to HTML scraping if API is not available ---
+            if not img_url:
+                page_resp = requests.get(astrobin_url, headers=headers, timeout=30)
+                if page_resp.status_code != 200:
+                    self.logger.error(f"Failed to load AstroBin page. Status code: {page_resp.status_code} URL: {astrobin_url}")
+                    return None
+
+                html = page_resp.text or ""
+
+                # 3a) Try to find ALL srcset/data-srcset entries and pick the
+                #     largest AstroBin CDN URL across them.
+                best_width = -1
+                best_url = None
+                for srcset_match in re.finditer(
+                    r'(?:srcset|data-srcset)\s*=\s*["\']([^"\']+)["\']',
+                    html,
+                    re.IGNORECASE,
+                ):
+                    srcset_value = srcset_match.group(1)
+                    for part in srcset_value.split(','):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        tokens = part.split()
+                        if not tokens:
+                            continue
+                        candidate_url = tokens[0]
+                        width = 0
+                        if len(tokens) > 1 and tokens[1].endswith('w'):
+                            try:
+                                width = int(tokens[1][:-1])
+                            except ValueError:
+                                width = 0
+                        # Prefer non-avatar AstroBin CDN URLs.
+                        if "astrobin.com" in candidate_url and "avatars" not in candidate_url:
+                            if width >= best_width:
+                                best_width = width
+                                best_url = candidate_url
+                if best_url:
+                    img_url = best_url
+
+                # 3b) Fallback to OpenGraph image, then Twitter image.
+                if not img_url:
+                    og_match = re.search(
+                        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                        html,
+                        re.IGNORECASE,
+                    )
+                    if og_match:
+                        img_url = og_match.group(1).strip()
+                    else:
+                        tw_match = re.search(
+                            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+                            html,
+                            re.IGNORECASE,
+                        )
+                        if tw_match:
+                            img_url = tw_match.group(1).strip()
+
+            if not img_url:
+                self.logger.error(f"Could not find image URL on AstroBin page: {astrobin_url}")
+                return None
+
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif img_url.startswith("/"):
+                img_url = urljoin(astrobin_url, img_url)
+
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            img_resp = requests.get(img_url, headers=headers, timeout=60)
+            if img_resp.status_code != 200:
+                self.logger.error(f"Failed to download AstroBin image. Status code: {img_resp.status_code} URL: {img_url}")
+                return None
+
+            try:
+                img = Image.open(BytesIO(img_resp.content))
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(save_path, "JPEG", quality=90)
+            except Exception as e:
+                self.logger.error(f"Failed to convert AstroBin image to JPEG: {e}")
+                return None
+
+            self.logger.info(f"Downloaded AstroBin image from {img_url} to {save_path}")
+            return save_path
+        except Exception as e:
+            self.logger.error(f"Error downloading AstroBin image from {astrobin_url}: {e}")
+            return None
+
 
     def Check_valid_notifications(self):
         # Check notifications and return valid mentions with images
@@ -126,6 +475,21 @@ class bluesky():
                             # Log errors if unable to create the post
                             self.logger.error("Error finding parent post: %s", e)
                             return post_id,None
+
+                    # If there is no direct image embed, but the text contains an AstroBin link,
+                    # resolve and download the image from AstroBin.
+                    has_image_embed = (
+                        hasattr(post_content, 'embed')
+                        and post_content.embed
+                        and hasattr(post_content.embed, 'images')
+                        and post_content.embed.images
+                    )
+                    if not has_image_embed:
+                        astrobin_url = self._extract_astrobin_url(post_text)
+                        if astrobin_url:
+                            downloaded_image_path = self.download_astrobin_image(astrobin_url)
+                            if downloaded_image_path:
+                                return post_id, downloaded_image_path
 
                     # Check if there is an embed with images
                     if hasattr(post_content, 'embed') and post_content.embed:
