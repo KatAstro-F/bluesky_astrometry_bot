@@ -8,7 +8,6 @@ from atproto import Client
 import json
 from datetime import datetime
 import requests
-from credentials import credentials
 
 try:
     # Optional: used only for high-res AstroBin downloads.
@@ -108,6 +107,51 @@ class bluesky():
         if not url.lower().startswith(("http://", "https://")):
             url = "https://" + url
         return url
+
+    def _extract_astrobin_url_from_embed(self, embed):
+        """
+        Try to extract an AstroBin URL from a Bluesky external-card embed
+        (app.bsky.embed.external), where the AstroBin link lives in
+        something like embed.external.uri.
+        """
+        if not embed:
+            return None
+
+        external = None
+        try:
+            if hasattr(embed, "external"):
+                external = embed.external
+        except Exception:
+            external = None
+
+        if external is None:
+            try:
+                if isinstance(embed, dict):
+                    external = embed.get("external")
+            except Exception:
+                external = None
+
+        if not external:
+            return None
+
+        uri = None
+        try:
+            if hasattr(external, "uri"):
+                uri = external.uri
+        except Exception:
+            uri = None
+
+        if uri is None:
+            try:
+                if isinstance(external, dict):
+                    uri = external.get("uri")
+            except Exception:
+                uri = None
+
+        if not uri:
+            return None
+
+        return self._extract_astrobin_url(str(uri))
 
     def _extract_astrobin_hash(self, astrobin_url):
         """
@@ -265,9 +309,7 @@ class bluesky():
              original image if publicly accessible.
           2) Try Selenium (real browser) to discover the largest AstroBin
              image requested by the page.
-          3) If AstroBin API credentials are configured, use the official API
-             to obtain the best url_* field (e.g., url_real or url_hd).
-          4) Otherwise, parse the HTML (srcset/OpenGraph/Twitter) as a fallback.
+          3) Otherwise, parse the HTML (srcset/OpenGraph/Twitter) as a fallback.
         """
         try:
             headers = {'User-Agent': 'YourBotName/1.0'}
@@ -285,55 +327,7 @@ class bluesky():
 
             img_url = None
 
-            # --- 3) Try AstroBin API for full resolution (optional) ---
-            api_key = credentials.get("ASTROBIN_API_KEY")
-            api_secret = credentials.get("ASTROBIN_API_SECRET")
-            astro_hash = self._extract_astrobin_hash(astrobin_url)
-
-            if api_key and api_secret and astro_hash:
-                try:
-                    api_base = "https://www.astrobin.com/api/v1/image/"
-                    params = {
-                        "api_key": api_key,
-                        "api_secret": api_secret,
-                        "format": "json",
-                        "hash": astro_hash,
-                    }
-                    api_resp = requests.get(api_base, params=params, timeout=30)
-                    if api_resp.status_code == 200:
-                        data = api_resp.json()
-                        image_obj = None
-                        if isinstance(data, dict):
-                            if data.get("objects"):
-                                image_obj = data["objects"][0]
-                            elif data.get("results"):
-                                image_obj = data["results"][0]
-                            else:
-                                image_obj = data
-                        elif isinstance(data, list) and data:
-                            image_obj = data[0]
-
-                        if isinstance(image_obj, dict):
-                            url_keys = [
-                                "url_real",
-                                "url_hd",
-                                "url_regular",
-                                "url_gallery",
-                                "url_big",
-                                "url",
-                            ]
-                            for key in url_keys:
-                                candidate = image_obj.get(key)
-                                if candidate:
-                                    img_url = candidate
-                                    self.logger.info(f"Using AstroBin API {key} for hash {astro_hash}")
-                                    break
-                    else:
-                        self.logger.warning(f"AstroBin API request failed ({api_resp.status_code}) for hash {astro_hash}")
-                except Exception as e:
-                    self.logger.warning(f"Error using AstroBin API for {astrobin_url}: {e}")
-
-            # --- 4) Fallback to HTML scraping if API is not available ---
+            # --- 3) Fallback to HTML scraping if higher-resolution sources are not available ---
             if not img_url:
                 page_resp = requests.get(astrobin_url, headers=headers, timeout=30)
                 if page_resp.status_code != 200:
@@ -476,8 +470,8 @@ class bluesky():
                             self.logger.error("Error finding parent post: %s", e)
                             return post_id,None
 
-                    # If there is no direct image embed, but the text contains an AstroBin link,
-                    # resolve and download the image from AstroBin.
+                    # If there is no direct image embed, but the post contains an AstroBin link
+                    # either in the text or in an external card embed, resolve and download it.
                     has_image_embed = (
                         hasattr(post_content, 'embed')
                         and post_content.embed
@@ -485,7 +479,13 @@ class bluesky():
                         and post_content.embed.images
                     )
                     if not has_image_embed:
+                        # 1) Look in plain text
                         astrobin_url = self._extract_astrobin_url(post_text)
+
+                        # 2) Otherwise, look in an external-card embed (link preview)
+                        if not astrobin_url and hasattr(post_content, 'embed') and post_content.embed:
+                            astrobin_url = self._extract_astrobin_url_from_embed(post_content.embed)
+
                         if astrobin_url:
                             downloaded_image_path = self.download_astrobin_image(astrobin_url)
                             if downloaded_image_path:
