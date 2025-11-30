@@ -153,6 +153,78 @@ class bluesky():
 
         return self._extract_astrobin_url(str(uri))
 
+    def _find_astrobin_in_mention_and_quoted(self, post, post_content):
+        """
+        Given a PostView (`post`) and its record (`post_content`), attempt to
+        find an AstroBin URL in:
+          1) The mention post's text.
+          2) Any external-card embed on the mention.
+          3) The quoted post's text.
+          4) Any external-card embed on the quoted post.
+        Returns a local image path if a download succeeds, otherwise None.
+        """
+        # 1) Mention text
+        post_text = getattr(post_content, "text", "") or ""
+        astrobin_url = self._extract_astrobin_url(post_text)
+
+        # 2) Mention external-card embeds (record-level and view-level)
+        if not astrobin_url:
+            embed_obj = getattr(post_content, "embed", None)
+            astrobin_url = self._extract_astrobin_url_from_embed(embed_obj)
+
+        if not astrobin_url and hasattr(post, "embed") and post.embed:
+            astrobin_url = self._extract_astrobin_url_from_embed(post.embed)
+
+        # 3) Quoted post: try to get the quoted record from the PostView's
+        #    embed view first (already-resolved), then fall back to using the
+        #    strongRef in the record embed and get_post_thread.
+        quoted_record = None
+
+        # 3a) Prefer the view-level embed (app.bsky.embed.record#view).
+        try:
+            if hasattr(post, "embed") and post.embed and hasattr(post.embed, "record"):
+                view_record = post.embed.record
+                if hasattr(view_record, "value"):
+                    quoted_record = view_record.value
+        except Exception:
+            quoted_record = None
+
+        # 3b) Fallback via strongRef (record-level embed).
+        if quoted_record is None:
+            embed_ref = getattr(post_content, "embed", None)
+            quoted_uri = None
+            try:
+                if hasattr(embed_ref, "record") and hasattr(embed_ref.record, "uri"):
+                    quoted_uri = embed_ref.record.uri
+                elif isinstance(embed_ref, dict) and "record" in embed_ref and isinstance(embed_ref["record"], dict):
+                    quoted_uri = embed_ref["record"].get("uri")
+            except Exception:
+                quoted_uri = None
+
+            if quoted_uri:
+                try:
+                    quoted_thread = self.client.app.bsky.feed.get_post_thread({'uri': quoted_uri})
+                    quoted_post = quoted_thread['thread']['post']
+                    quoted_record = quoted_post['record']
+                except Exception as e:
+                    self.logger.error("Error fetching quoted post for AstroBin link: %s", e)
+                    quoted_record = None
+
+        # 3c) Search the quoted Record, if any.
+        if not astrobin_url and quoted_record is not None:
+            quoted_text = getattr(quoted_record, "text", "") or ""
+            astrobin_url = self._extract_astrobin_url(quoted_text)
+
+            if not astrobin_url and hasattr(quoted_record, "embed") and quoted_record.embed:
+                astrobin_url = self._extract_astrobin_url_from_embed(quoted_record.embed)
+
+        if not astrobin_url:
+            return None
+
+        # Try to download from AstroBin.
+        downloaded_image_path = self.download_astrobin_image(astrobin_url)
+        return downloaded_image_path
+
     def _extract_astrobin_hash(self, astrobin_url):
         """
         Extract the AstroBin image hash from a URL such as:
@@ -470,27 +542,6 @@ class bluesky():
                             self.logger.error("Error finding parent post: %s", e)
                             return post_id,None
 
-                    # If there is no direct image embed, but the post contains an AstroBin link
-                    # either in the text or in an external card embed, resolve and download it.
-                    has_image_embed = (
-                        hasattr(post_content, 'embed')
-                        and post_content.embed
-                        and hasattr(post_content.embed, 'images')
-                        and post_content.embed.images
-                    )
-                    if not has_image_embed:
-                        # 1) Look in plain text
-                        astrobin_url = self._extract_astrobin_url(post_text)
-
-                        # 2) Otherwise, look in an external-card embed (link preview)
-                        if not astrobin_url and hasattr(post_content, 'embed') and post_content.embed:
-                            astrobin_url = self._extract_astrobin_url_from_embed(post_content.embed)
-
-                        if astrobin_url:
-                            downloaded_image_path = self.download_astrobin_image(astrobin_url)
-                            if downloaded_image_path:
-                                return post_id, downloaded_image_path
-
                     # Check if there is an embed with images
                     if hasattr(post_content, 'embed') and post_content.embed:
                         
@@ -515,14 +566,16 @@ class bluesky():
                                 except Exception as e:
                                     # Log errors if unable to create the post
                                     self.logger.error("Error finding image in quoted post: %s", e)
-                                    return post_id,None
+                                    # Do not return here; fall through so AstroBin
+                                    # link detection can still run later.
                         else:
                             try:
                                 alt_link=post['embed']['images'][0]["fullsize"]
                             except Exception as e:
                                 # Log errors if unable to create the post
                                 self.logger.error("Error finding image in quoted post: %s", e)
-                                return post_id,None
+                                # Keep going without alt_link; we might still
+                                # download via the primary CDN URL.
                             
                         if hasattr(embed, 'images') and embed.images:
                             images = embed.images
@@ -546,10 +599,16 @@ class bluesky():
                                     if hasattr(reply_ref, "root") and reply_ref.root:
                                         root_uri = reply_ref.root.uri
                                         root_cid = reply_ref.root.cid
-                                
+
                                 # Construct a dictionary with post IDs for replying
                                 post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
                                 return post_id, downloaded_image_path
+
+                    # If no image was found, look for AstroBin links in the
+                    # mention post and, if present, in the quoted post.
+                    downloaded_image_path = self._find_astrobin_in_mention_and_quoted(post, post_content)
+                    if downloaded_image_path:
+                        return post_id, downloaded_image_path
         return None
 
 
