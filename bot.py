@@ -85,15 +85,21 @@ if __name__ == "__main__":
             (skymap2_path, "Sky map - Zoom level 2"),
         ]
 
-        success=False
+        # First, ensure the reply is posted (retry on transient errors).
+        success = False
         while not success:
             try:
-                # Post a reply with the images and the generated text
                 bs.post_reply(images_list, reply_text, post_id)
-                bs.repost_original_post(post_id["parent_uri"],post_id["parent_cid"])
-                success=True
-                time.sleep(120)
+                success = True
             except Exception as e:
                 logger.error("Error posting reply: %s", e)
 
-        
+        # Once the reply succeeded, attempt a single repost of the original post.
+        try:
+            bs.repost_original_post(post_id["parent_uri"], post_id["parent_cid"])
+        except Exception as e:
+            logger.error("Error reposting original post: %s", e)
+
+        # Brief pause before checking for new notifications again
+        time.sleep(120)
+

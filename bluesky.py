@@ -407,6 +407,11 @@ class bluesky():
                     return None
 
                 html = page_resp.text or ""
+                astro_hash = self._extract_astrobin_hash(astrobin_url)
+                bad_tokens = [
+                    "avatar", "logo", "favicon", "apple-touch-icon", "icon",
+                    "badge", "sprite", "placeholder", "default", "branding",
+                ]
 
                 # 3a) Try to find ALL srcset/data-srcset entries and pick the
                 #     largest AstroBin CDN URL across them.
@@ -432,15 +437,56 @@ class bluesky():
                                 width = int(tokens[1][:-1])
                             except ValueError:
                                 width = 0
-                        # Prefer non-avatar AstroBin CDN URLs.
-                        if "astrobin.com" in candidate_url and "avatars" not in candidate_url:
+                        candidate_lower = candidate_url.lower()
+                        # Prefer non-asset AstroBin CDN URLs.
+                        if "astrobin.com" in candidate_lower and not any(tok in candidate_lower for tok in bad_tokens):
                             if width >= best_width:
                                 best_width = width
                                 best_url = candidate_url
                 if best_url:
                     img_url = best_url
 
-                # 3b) Fallback to OpenGraph image, then Twitter image.
+                # 3b) Look for AstroBin CDN URLs in the HTML payload.
+                if not img_url:
+                    candidates = set()
+                    for match in re.finditer(
+                        r'(?:(?:https?:)?//[^"\'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s]*)?)',
+                        html,
+                        re.IGNORECASE,
+                    ):
+                        candidate = match.group(0)
+                        if candidate.startswith("//"):
+                            candidate = "https:" + candidate
+                        candidate_lower = candidate.lower()
+                        if "astrobin.com" not in candidate_lower:
+                            continue
+                        if any(tok in candidate_lower for tok in bad_tokens):
+                            continue
+                        candidates.add(candidate)
+
+                    if candidates:
+                        def score_url(url):
+                            lower = url.lower()
+                            score = 0
+                            if "cdn.astrobin.com" in lower:
+                                score += 3
+                            if "/images/" in lower:
+                                score += 2
+                            if any(tok in lower for tok in ["raw", "full", "fullsize", "original"]):
+                                score += 2
+                            if astro_hash and astro_hash in lower:
+                                score += 3
+                            m = re.search(r'(?:[?&](?:w|width)=)(\d+)', lower)
+                            if m:
+                                try:
+                                    score += min(int(m.group(1)) // 500, 4)
+                                except ValueError:
+                                    pass
+                            return score
+
+                        img_url = sorted(candidates, key=score_url, reverse=True)[0]
+
+                # 3c) Fallback to OpenGraph image, then Twitter image.
                 if not img_url:
                     og_match = re.search(
                         r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -448,7 +494,10 @@ class bluesky():
                         re.IGNORECASE,
                     )
                     if og_match:
-                        img_url = og_match.group(1).strip()
+                        candidate = og_match.group(1).strip()
+                        candidate_lower = candidate.lower()
+                        if not any(tok in candidate_lower for tok in bad_tokens):
+                            img_url = candidate
                     else:
                         tw_match = re.search(
                             r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -456,7 +505,10 @@ class bluesky():
                             re.IGNORECASE,
                         )
                         if tw_match:
-                            img_url = tw_match.group(1).strip()
+                            candidate = tw_match.group(1).strip()
+                            candidate_lower = candidate.lower()
+                            if not any(tok in candidate_lower for tok in bad_tokens):
+                                img_url = candidate
 
             if not img_url:
                 self.logger.error(f"Could not find image URL on AstroBin page: {astrobin_url}")
@@ -510,15 +562,59 @@ class bluesky():
                 post = post_thread['thread']['post']
                 post_content = post['record']
                 post_text = post_content.text
-                mention_record = post_content  # MODIFIED (B fix): keep the original mention's record
+                mention_record = post_content  # Keep the original mention's record
 
-                # Get root and parent URIs and CIDs for reply 
+                # Default to replying to the mention itself.
                 root_uri = post["uri"]
                 root_cid = post["cid"]
-                # The key: always attach to *this* post (child) so your reply is not orphaned
                 parent_uri = post["uri"]
                 parent_cid = post["cid"]
-                
+
+                # If the mention is a reply, point the reply at the original/root post.
+                reply_ref = None
+                try:
+                    if hasattr(mention_record, "reply"):
+                        reply_ref = mention_record.reply
+                except Exception:
+                    reply_ref = None
+                if reply_ref is None and isinstance(mention_record, dict):
+                    reply_ref = mention_record.get("reply")
+
+                if reply_ref:
+                    root_ref = None
+                    parent_ref = None
+                    try:
+                        if hasattr(reply_ref, "root"):
+                            root_ref = reply_ref.root
+                        if hasattr(reply_ref, "parent"):
+                            parent_ref = reply_ref.parent
+                    except Exception:
+                        root_ref = None
+                        parent_ref = None
+                    if root_ref is None and isinstance(reply_ref, dict):
+                        root_ref = reply_ref.get("root")
+                    if parent_ref is None and isinstance(reply_ref, dict):
+                        parent_ref = reply_ref.get("parent")
+
+                    if root_ref:
+                        if hasattr(root_ref, "uri"):
+                            root_uri = root_ref.uri
+                            root_cid = root_ref.cid
+                        elif isinstance(root_ref, dict):
+                            root_uri = root_ref.get("uri", root_uri)
+                            root_cid = root_ref.get("cid", root_cid)
+                    elif parent_ref:
+                        if hasattr(parent_ref, "uri"):
+                            root_uri = parent_ref.uri
+                            root_cid = parent_ref.cid
+                        elif isinstance(parent_ref, dict):
+                            root_uri = parent_ref.get("uri", root_uri)
+                            root_cid = parent_ref.get("cid", root_cid)
+
+                    # Reply directly to the original/root message.
+                    parent_uri = root_uri
+                    parent_cid = root_cid
+
                 # Construct a dictionary with post IDs for replying
                 post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
 
@@ -591,17 +687,6 @@ class bluesky():
                                 # Download the image
                                 downloaded_image_path = self.download_image(author_did, image_cid,alt_link)
 
-                                # Correct the problem of orphan post when replying to a comment of a root post
-                                # MODIFIED (B fix): compute root from the ORIGINAL mention's record,
-                                # not from `post` which may have been switched to the parent to fetch the image.
-                                if hasattr(mention_record, "reply") and mention_record.reply:
-                                    reply_ref = mention_record.reply
-                                    if hasattr(reply_ref, "root") and reply_ref.root:
-                                        root_uri = reply_ref.root.uri
-                                        root_cid = reply_ref.root.cid
-
-                                # Construct a dictionary with post IDs for replying
-                                post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
                                 return post_id, downloaded_image_path
 
                     # If no image was found, look for AstroBin links in the
