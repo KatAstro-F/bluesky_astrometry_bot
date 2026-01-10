@@ -1,8 +1,11 @@
 import os
+import re
 from atproto import Client
 import json
 from datetime import datetime
 import requests
+
+from astrobin_fetch_main_image import extract_hash, download_file, get_main_image_url
 
 class bluesky():
 
@@ -87,6 +90,49 @@ class bluesky():
 
         inner = getattr(record_part, 'record', None) or self._get_field(record_part, 'record')
         return getattr(inner, 'uri', None) or self._get_field(inner, 'uri')
+
+    def _normalize_url(self, url):
+        if not url:
+            return None
+        url = str(url).strip()
+        # Strip common punctuation around URLs in text.
+        url = url.strip("()[]{}<>,.?!\"'")
+        if not url:
+            return None
+        if url.startswith("www."):
+            url = "https://" + url
+        if url.startswith("app.astrobin.com/") or url.startswith("astrobin.com/"):
+            url = "https://" + url
+        return url
+
+    def _extract_astrobin_urls(self, post_view, record, record_embed):
+        urls = []
+
+        text = self._get_field(record, 'text', '') or ''
+        for match in re.finditer(r"(https?://[^\s]+|(?:www\.)?[^\s]+\.[^\s/]+/[^\s]+)", text, flags=re.IGNORECASE):
+            candidate = self._normalize_url(match.group(0))
+            if candidate:
+                urls.append(candidate)
+
+        # External card embeds often carry the URL even if the text doesn't.
+        if record_embed and hasattr(record_embed, 'external') and record_embed.external:
+            candidate = self._normalize_url(getattr(record_embed.external, 'uri', None))
+            if candidate:
+                urls.append(candidate)
+
+        view_embed = self._get_field(post_view, 'embed')
+        external_view = self._get_field(view_embed, 'external')
+        if external_view:
+            candidate = self._normalize_url(self._get_field(external_view, 'uri'))
+            if candidate:
+                urls.append(candidate)
+
+        # Keep only AstroBin links.
+        astrobin_urls = []
+        for url in urls:
+            if re.search(r"://(?:app\.)?astrobin\.com/", url, flags=re.IGNORECASE):
+                astrobin_urls.append(url)
+        return astrobin_urls
 
     def load_processed_notifications(self):
         # Load the set of processed notifications from the JSON file
@@ -188,6 +234,20 @@ class bluesky():
                     self.logger.error("Error finding image in quoted post: %s", e)
                     return None
 
+        # Case D: AstroBin link in the post (text or external-card embed).
+        for astrobin_url in self._extract_astrobin_urls(post_view, record, embed):
+            try:
+                main_url = get_main_image_url(astrobin_url)
+                if not main_url:
+                    continue
+                image_hash = extract_hash(astrobin_url) or "astrobin"
+                out_path = os.path.join("results", f"astrobin_{image_hash}.jpg")
+                download_file(main_url, out_path)
+                return out_path
+            except Exception as e:
+                self.logger.error("Error downloading AstroBin image for %s: %s", astrobin_url, e)
+                continue
+
         # No images found (external embeds, videos, etc.)
         return None
 
@@ -225,41 +285,46 @@ class bluesky():
                 # original message (the thread root), not to the comment. Previously `parent` was
                 # always set to the mention post, and `root` was only corrected in a later branch,
                 # so replies could be created with the wrong `root`/`parent` and appear "lost".
-                root_uri = post["uri"]
-                root_cid = post["cid"]
-                parent_uri = post["uri"]
-                parent_cid = post["cid"]
+                mention_uri = post["uri"]
+                mention_cid = post["cid"]
+
+                root_uri = mention_uri
+                root_cid = mention_cid
                 if hasattr(mention_record, "reply") and mention_record.reply:
                     reply_ref = mention_record.reply
                     if hasattr(reply_ref, "root") and reply_ref.root:
                         root_uri = reply_ref.root.uri
                         root_cid = reply_ref.root.cid
-                        # Mention in a comment/reply: answer to the original message (root post).
-                        parent_uri = root_uri
-                        parent_cid = root_cid
-
-                # Construct a dictionary with post IDs for replying
-                post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
 
                 # Check if the bot is mentioned in the post text
                 if self.botname in post_text.lower():
                     self.logger.info(f"Bot was tagged in a post: {post_text}")
-                    # Image selection logic:
-                    # 1) If the mention post contains an image (or quotes an image), process it.
-                    # 2) If the mention post contains *no image* and it's a comment, look at the parent post.
-                    #    This implements the expected behavior for: "mention in a comment with no image,
-                    #    but the parent post has an image".
-                    downloaded_image_path = self._download_first_image_from_post(post, allow_quote=True)
-                    if not downloaded_image_path:
-                        try:
-                            parent = post_thread['thread']['parent']
-                            parent_post = self._get_field(parent, 'post')
-                            if parent_post:
-                                downloaded_image_path = self._download_first_image_from_post(parent_post, allow_quote=True)
-                        except Exception as e:
-                            self.logger.error("Error finding parent post: %s", e)
 
-                    return post_id, downloaded_image_path
+                    # Reply target selection:
+                    # - If the mention post itself provides the image (direct/quote/AstroBin), reply to the mention post.
+                    # - If the mention post has no image and is a comment, fall back to the parent post's image
+                    #   and reply to the original message (thread root).
+
+                    downloaded_image_path = self._download_first_image_from_post(post, allow_quote=True)
+                    if downloaded_image_path:
+                        post_id = {"root_uri": root_uri, "root_cid": root_cid, "parent_uri": mention_uri, "parent_cid": mention_cid}
+                        return post_id, downloaded_image_path
+
+                    # No image found in mention post: if this is a comment, try parent post.
+                    try:
+                        parent = post_thread['thread']['parent']
+                        parent_post = self._get_field(parent, 'post')
+                    except Exception:
+                        parent_post = None
+
+                    if parent_post:
+                        downloaded_image_path = self._download_first_image_from_post(parent_post, allow_quote=True)
+                        post_id = {"root_uri": root_uri, "root_cid": root_cid, "parent_uri": root_uri, "parent_cid": root_cid}
+                        return post_id, downloaded_image_path
+
+                    # Otherwise: no image anywhere; reply to the mention post (so the user sees the failure reply).
+                    post_id = {"root_uri": root_uri, "root_cid": root_cid, "parent_uri": mention_uri, "parent_cid": mention_cid}
+                    return post_id, None
         return None
 
 
