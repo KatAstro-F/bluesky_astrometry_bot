@@ -19,6 +19,75 @@ class bluesky():
         self.processed_notifications = self.load_processed_notifications()  # Load processed notifications
         self.logger=logger  # Store the logger
 
+    def _get_field(self, obj, key, default=None):
+        """
+        Best-effort accessor that works across:
+        - plain dicts
+        - atproto_client DotDict
+        - pydantic models from atproto_client
+        """
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        try:
+            value = obj[key]
+            if value is not None:
+                return value
+        except Exception:
+            pass
+        return getattr(obj, key, default)
+
+    def _get_first_image_fullsize(self, post_view):
+        """Extract a CDN fullsize URL from the *view* embed if present (images or recordWithMedia)."""
+        view_embed = self._get_field(post_view, 'embed')
+        if not view_embed:
+            return None
+
+        images = self._get_field(view_embed, 'images')
+        if images:
+            return self._get_field(images[0], 'fullsize')
+
+        media = self._get_field(view_embed, 'media')
+        if media:
+            images = self._get_field(media, 'images')
+            if images:
+                return self._get_field(images[0], 'fullsize')
+
+        return None
+
+    def _get_first_image_cid(self, images_embed):
+        """
+        Extract the blob ref CID/link from an *images record embed*.
+        Returns "" if not available (caller can still download using alt_link).
+        """
+        images = getattr(images_embed, 'images', None)
+        if not images:
+            return ""
+
+        first = images[0]
+        blob = getattr(first, 'image', None) or self._get_field(first, 'image')
+        ref = getattr(blob, 'ref', None) or self._get_field(blob, 'ref')
+        link = getattr(ref, 'link', None) or self._get_field(ref, 'link') or self._get_field(ref, '$link')
+        return link or ""
+
+    def _get_quoted_uri(self, embed):
+        """
+        Extract the quoted record URI from embeds that support quoting:
+        - app.bsky.embed.record (embed.record.uri)
+        - app.bsky.embed.recordWithMedia (embed.record.record.uri)
+        """
+        record_part = getattr(embed, 'record', None) or self._get_field(embed, 'record')
+        if not record_part:
+            return None
+
+        uri = getattr(record_part, 'uri', None) or self._get_field(record_part, 'uri')
+        if uri:
+            return uri
+
+        inner = getattr(record_part, 'record', None) or self._get_field(record_part, 'record')
+        return getattr(inner, 'uri', None) or self._get_field(inner, 'uri')
+
     def load_processed_notifications(self):
         # Load the set of processed notifications from the JSON file
         if os.path.exists(self.PROCESSED_NOTIFICATIONS_FILE):
@@ -52,26 +121,75 @@ class bluesky():
     def download_image(self, author_did, cid, alt_link,save_path='results/downloaded_image.jpg'):
         # Download an image from Bluesky CDN using the author's DID and CID of the image
         try:
-            image_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}"
             headers = {'User-Agent': 'YourBotName/1.0'}
-            response = requests.get(image_url, headers=headers)
-            if not response.status_code == 200:
-                #some link are indirect try alt link in case of failure
-                response = requests.get(alt_link, headers=headers)
-            if  response.status_code == 200:
+            # Prefer the fully-qualified CDN URL from the AppView when available.
+            # This is more reliable for quoted images (different author DID) and for various embed shapes.
+            response = None
+            if alt_link:
+                response = requests.get(alt_link, headers=headers, timeout=30)
+
+            if (response is None or response.status_code != 200) and author_did and cid:
+                image_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}"
+                response = requests.get(image_url, headers=headers, timeout=30)
+
+            if response is not None and response.status_code == 200:
                 # Save the downloaded image locally
                 with open(save_path, 'wb') as file:
                     file.write(response.content)
-                self.logger.info(f"Image downloaded from {image_url}: {save_path}")
+                self.logger.info(f"Image downloaded: {save_path}")
                 return save_path
             else:
                 # Log error if the download fails (non-200 status code)
-                self.logger.error(f"Failed to download image. Status code: {response.status_code} URL: {image_url}")
+                status = getattr(response, "status_code", None)
+                self.logger.error(f"Failed to download image. Status code: {status} alt_link: {alt_link}")
                 return None
         except Exception as e:
             # Log exception if something goes wrong during download
             self.logger.error(f"Error downloading image: {e}")
             return None
+
+    def _download_first_image_from_post(self, post_view, *, allow_quote=True):
+        """
+        Try to find an image in a post (including quoted posts) and download it.
+        Returns a local filepath or None.
+        """
+        record = self._get_field(post_view, 'record')
+        if not record:
+            return None
+
+        embed = getattr(record, 'embed', None)
+        if not embed:
+            return None
+
+        author = self._get_field(post_view, 'author')
+        author_did = self._get_field(author, 'did')
+
+        # Case A: post contains images directly.
+        if hasattr(embed, 'images') and embed.images:
+            alt_link = self._get_first_image_fullsize(post_view)
+            cid = self._get_first_image_cid(embed)
+            return self.download_image(author_did, cid, alt_link)
+
+        # Case B: recordWithMedia where media is images.
+        if hasattr(embed, 'media') and embed.media and hasattr(embed.media, 'images') and embed.media.images:
+            alt_link = self._get_first_image_fullsize(post_view)
+            cid = self._get_first_image_cid(embed.media)
+            return self.download_image(author_did, cid, alt_link)
+
+        # Case C: quoted post (with or without media).
+        if allow_quote:
+            quoted_uri = self._get_quoted_uri(embed)
+            if quoted_uri:
+                try:
+                    quoted_thread = self.client.app.bsky.feed.get_post_thread({'uri': quoted_uri})
+                    quoted_post = quoted_thread['thread']['post']
+                    return self._download_first_image_from_post(quoted_post, allow_quote=False)
+                except Exception as e:
+                    self.logger.error("Error finding image in quoted post: %s", e)
+                    return None
+
+        # No images found (external embeds, videos, etc.)
+        return None
 
 
     def Check_valid_notifications(self):
@@ -97,95 +215,51 @@ class bluesky():
                 post_text = post_content.text
                 mention_record = post_content  # MODIFIED (B fix): keep the original mention's record
 
-                # Get root and parent URIs and CIDs for reply 
+                # Compute the reply threading references.
+                #
+                # Bluesky threading is determined by `reply.root` and `reply.parent`:
+                # - `parent` is the post you reply to
+                # - `root` is the top of the thread
+                #
+                # Fix: when the bot is mentioned in a *comment*, we want the bot to reply to the
+                # original message (the thread root), not to the comment. Previously `parent` was
+                # always set to the mention post, and `root` was only corrected in a later branch,
+                # so replies could be created with the wrong `root`/`parent` and appear "lost".
                 root_uri = post["uri"]
                 root_cid = post["cid"]
-                # The key: always attach to *this* post (child) so your reply is not orphaned
                 parent_uri = post["uri"]
                 parent_cid = post["cid"]
-                
+                if hasattr(mention_record, "reply") and mention_record.reply:
+                    reply_ref = mention_record.reply
+                    if hasattr(reply_ref, "root") and reply_ref.root:
+                        root_uri = reply_ref.root.uri
+                        root_cid = reply_ref.root.cid
+                        # Mention in a comment/reply: answer to the original message (root post).
+                        parent_uri = root_uri
+                        parent_cid = root_cid
+
                 # Construct a dictionary with post IDs for replying
                 post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
 
                 # Check if the bot is mentioned in the post text
                 if self.botname in post_text.lower():
                     self.logger.info(f"Bot was tagged in a post: {post_text}")
-                    alt_link=None
-                    if not (hasattr(post_content, 'embed') and post_content.embed):
+                    # Image selection logic:
+                    # 1) If the mention post contains an image (or quotes an image), process it.
+                    # 2) If the mention post contains *no image* and it's a comment, look at the parent post.
+                    #    This implements the expected behavior for: "mention in a comment with no image,
+                    #    but the parent post has an image".
+                    downloaded_image_path = self._download_first_image_from_post(post, allow_quote=True)
+                    if not downloaded_image_path:
                         try:
-                            #check if the post is a comment from a parent post
-                            if post_thread['thread']['parent'] is None :
-                                return post_id,None
-                            #check if the comment author is the  original post author to avoid spam
-                            if post["author"]["handle"]==post_thread['thread']['parent']['post']["author"]["handle"]:
-                                post = post_thread['thread']['parent']['post']
-                                post_content = post['record']
-                            else:
-                                return post_id,None
+                            parent = post_thread['thread']['parent']
+                            parent_post = self._get_field(parent, 'post')
+                            if parent_post:
+                                downloaded_image_path = self._download_first_image_from_post(parent_post, allow_quote=True)
                         except Exception as e:
-                            # Log errors if unable to create the post
                             self.logger.error("Error finding parent post: %s", e)
-                            return post_id,None
 
-                    # Check if there is an embed with images
-                    if hasattr(post_content, 'embed') and post_content.embed:
-                        
-                        embed = post_content.embed
-                        if not(hasattr(embed, 'images') and embed.images):
-                            #handle case where images is embedded together with a quoted post (pffff)
-                            if (hasattr(embed, 'media') and hasattr(embed.media, 'images')) and embed.media.images:   
-                                #image_cid=embed.media.images[0].image.ref.link 
-                                embed=embed.media
-                                alt_link=None
-                            else:     
-                                try:
-                                    #if not image in the post try to get the image in the quoted post
-                                    quoted_thread=self.client.app.bsky.feed.get_post_thread({'uri':embed["record"]["uri"] })
-                                    embed=quoted_thread['thread']['post']['record'].embed
-                                    if (hasattr(quoted_thread['thread']['post']['embed'], 'images') and quoted_thread['thread']['post']['embed'].images):
-                                        alt_link=quoted_thread['thread']['post']['embed']['images'][0]["fullsize"]
-                                    else:
-                                        embed=quoted_thread['thread']['post']['embed'].media
-                                        alt_link=embed.images[0].fullsize
-                                        
-                                except Exception as e:
-                                    # Log errors if unable to create the post
-                                    self.logger.error("Error finding image in quoted post: %s", e)
-                                    return post_id,None
-                        else:
-                            try:
-                                alt_link=post['embed']['images'][0]["fullsize"]
-                            except Exception as e:
-                                # Log errors if unable to create the post
-                                self.logger.error("Error finding image in quoted post: %s", e)
-                                return post_id,None
-                            
-                        if hasattr(embed, 'images') and embed.images:
-                            images = embed.images
-                            if images: 
-                                # Get the CID of the first image 
-                                #if image_cid is None:
-                                if hasattr(embed.images[0],"image"):
-                                    image_cid = images[0].image.ref.link
-                                else:
-                                    image_cid=""
-                                # Get the author's DID
-                                author_did = post['author']['did']
-                                # Download the image
-                                downloaded_image_path = self.download_image(author_did, image_cid,alt_link)
-
-                                # Correct the problem of orphan post when replying to a comment of a root post
-                                # MODIFIED (B fix): compute root from the ORIGINAL mention's record,
-                                # not from `post` which may have been switched to the parent to fetch the image.
-                                if hasattr(mention_record, "reply") and mention_record.reply:
-                                    reply_ref = mention_record.reply
-                                    if hasattr(reply_ref, "root") and reply_ref.root:
-                                        root_uri = reply_ref.root.uri
-                                        root_cid = reply_ref.root.cid
-                                
-                                # Construct a dictionary with post IDs for replying
-                                post_id = { "root_uri" : root_uri, "root_cid" : root_cid, "parent_uri":parent_uri,"parent_cid":parent_cid}
-                                return post_id, downloaded_image_path
+                    return post_id, downloaded_image_path
         return None
 
 
