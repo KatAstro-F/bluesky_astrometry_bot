@@ -8,7 +8,6 @@ from atproto import Client
 import json
 from datetime import datetime
 import requests
-from astrobin_fetch_main_image import get_main_image_url
 
 try:
     # Optional: used only for high-res AstroBin downloads.
@@ -283,43 +282,6 @@ class bluesky():
             self.logger.warning(f"Error using AstroBin download URL {download_url}: {e}")
             return None
 
-    def _download_astrobin_via_api(self, astrobin_url, headers, save_path):
-        """
-        Use AstroBin's public API to resolve the image hash to thumbnail URLs,
-        then download the largest available thumbnail.
-        """
-        api_headers = {
-            "User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
-            "Accept": "application/json",
-            "Referer": "https://app.astrobin.com/",
-        }
-        try:
-            best_url = get_main_image_url(astrobin_url, headers=api_headers, timeout=30)
-        except Exception as e:
-            self.logger.warning(f"Error querying AstroBin API: {e}")
-            return None
-        if not best_url:
-            return None
-
-        try:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            img_resp = requests.get(best_url, headers=headers, timeout=60)
-            if img_resp.status_code != 200:
-                self.logger.error(
-                    f"Failed to download AstroBin image. Status code: {img_resp.status_code} URL: {best_url}"
-                )
-                return None
-            img = Image.open(BytesIO(img_resp.content))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(save_path, "JPEG", quality=90)
-        except Exception as e:
-            self.logger.error(f"Failed to download AstroBin image via API: {e}")
-            return None
-
-        self.logger.info(f"Downloaded AstroBin image via API from {best_url} to {save_path}")
-        return save_path
-
     def _download_astrobin_via_selenium(self, astrobin_url, headers, save_path):
         """
         Use a real browser (Selenium + Chrome) to load the AstroBin page,
@@ -421,10 +383,9 @@ class bluesky():
         Prefer the highest-resolution image available:
           1) Try AstroBin's public download URL (?download=1) to get the
              original image if publicly accessible.
-          2) Try the public AstroBin API for the largest available thumbnail.
-          3) Try Selenium (real browser) to discover the largest AstroBin
+          2) Try Selenium (real browser) to discover the largest AstroBin
              image requested by the page.
-          4) Otherwise, parse the HTML (srcset/OpenGraph/Twitter) as a fallback.
+          3) Otherwise, parse the HTML (srcset/OpenGraph/Twitter) as a fallback.
         """
         try:
             headers = {'User-Agent': 'YourBotName/1.0'}
@@ -434,12 +395,7 @@ class bluesky():
             if original_path:
                 return original_path
 
-            # --- 2) Try AstroBin's public API for the largest thumbnail ---
-            api_path = self._download_astrobin_via_api(astrobin_url, headers, save_path)
-            if api_path:
-                return api_path
-
-            # --- 3) Try using Selenium to mimic a real browser and
+            # --- 2) Try using Selenium to mimic a real browser and
             #         discover the largest image used by the viewer.
             selenium_path = self._download_astrobin_via_selenium(astrobin_url, headers, save_path)
             if selenium_path:
@@ -447,7 +403,7 @@ class bluesky():
 
             img_url = None
 
-            # --- 4) Fallback to HTML scraping if higher-resolution sources are not available ---
+            # --- 3) Fallback to HTML scraping if higher-resolution sources are not available ---
             if not img_url:
                 page_resp = requests.get(astrobin_url, headers=headers, timeout=30)
                 if page_resp.status_code != 200:
