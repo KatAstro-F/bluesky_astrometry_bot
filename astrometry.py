@@ -94,6 +94,20 @@ class astrometry():
             response_data = response.json()
             jobs = response_data.get("jobs", [])
             calibrations = response_data.get("job_calibrations", [])
+            error_message = response_data.get("error_message")
+            processing_finished = response_data.get("processing_finished")
+
+            if error_message:
+                raise Exception(f"Astrometry submission {subid} failed: {error_message}")
+
+            if processing_finished and not jobs:
+                # Observed on nova: processing can be marked finished briefly before
+                # jobs/job_calibrations are visible via API. Keep polling.
+                self.logger.warning(
+                    "Submission %s is marked finished but has no jobs yet; retrying.",
+                    subid
+                )
+
             return jobs, calibrations
         except requests.exceptions.RequestException as e:
             # Transient issue: let the outer loop keep waiting using existing sleeps/timeouts

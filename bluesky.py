@@ -4,6 +4,7 @@ from atproto import Client
 import json
 from datetime import datetime
 import requests
+from PIL import Image
 
 from astrobin_fetch_main_image import extract_hash, download_file, get_main_image_url
 
@@ -164,6 +165,40 @@ class bluesky():
         }
         return image_blob_ref
 
+    def _normalize_downloaded_image_for_astrometry(self, image_path, content_type="", source_url=""):
+        """
+        Ensure downloaded bytes are a readable image and normalize to JPEG.
+        This avoids uploading WEBP bytes under a .jpg filename to astrometry.net.
+        """
+        try:
+            with Image.open(image_path) as img:
+                detected_format = (img.format or "unknown").upper()
+                width, height = img.size
+                if detected_format != "JPEG":
+                    rgb_img = img.convert("RGB")
+                    rgb_img.save(image_path, "JPEG", quality=92)
+                    self.logger.info(
+                        "Normalized downloaded image to JPEG (source_format=%s, content_type=%s, size=%sx%s, source=%s)",
+                        detected_format, content_type or "unknown", width, height, source_url or "n/a"
+                    )
+                else:
+                    self.logger.info(
+                        "Downloaded image is JPEG (size=%sx%s, source=%s)",
+                        width, height, source_url or "n/a"
+                    )
+            return image_path
+        except Exception as e:
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            except Exception:
+                pass
+            self.logger.error(
+                "Downloaded file is not a valid image for astrometry (content_type=%s, source=%s): %s",
+                content_type or "unknown", source_url or "n/a", e
+            )
+            return None
+
     def download_image(self, author_did, cid, alt_link,save_path='results/downloaded_image.jpg'):
         # Download an image from Bluesky CDN using the author's DID and CID of the image
         try:
@@ -171,19 +206,27 @@ class bluesky():
             # Prefer the fully-qualified CDN URL from the AppView when available.
             # This is more reliable for quoted images (different author DID) and for various embed shapes.
             response = None
+            source_url = None
             if alt_link:
                 response = requests.get(alt_link, headers=headers, timeout=30)
+                source_url = alt_link
 
             if (response is None or response.status_code != 200) and author_did and cid:
                 image_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{author_did}/{cid}"
                 response = requests.get(image_url, headers=headers, timeout=30)
+                source_url = image_url
 
             if response is not None and response.status_code == 200:
                 # Save the downloaded image locally
                 with open(save_path, 'wb') as file:
                     file.write(response.content)
-                self.logger.info(f"Image downloaded: {save_path}")
-                return save_path
+                content_type = response.headers.get("Content-Type", "")
+                normalized_path = self._normalize_downloaded_image_for_astrometry(
+                    save_path, content_type=content_type, source_url=source_url
+                )
+                if normalized_path:
+                    self.logger.info("Image downloaded: %s (content_type=%s)", normalized_path, content_type or "unknown")
+                return normalized_path
             else:
                 # Log error if the download fails (non-200 status code)
                 status = getattr(response, "status_code", None)
