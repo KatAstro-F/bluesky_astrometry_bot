@@ -102,7 +102,7 @@ class bluesky():
             return None
         if url.startswith("www."):
             url = "https://" + url
-        if url.startswith("app.astrobin.com/") or url.startswith("astrobin.com/"):
+        if url.startswith("app.astrobin.com/") or url.startswith("astrobin.com/") or url.startswith("www.astrobin.com/"):
             url = "https://" + url
         return url
 
@@ -131,7 +131,7 @@ class bluesky():
         # Keep only AstroBin links.
         astrobin_urls = []
         for url in urls:
-            if re.search(r"://(?:app\.)?astrobin\.com/", url, flags=re.IGNORECASE):
+            if re.search(r"://(?:app\.|www\.)?astrobin\.com/", url, flags=re.IGNORECASE):
                 astrobin_urls.append(url)
         return astrobin_urls
 
