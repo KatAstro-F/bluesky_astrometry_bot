@@ -25,3 +25,5 @@ results/*
 
 # 1) Do not track credentials.py
 /credentials.py
+# Do not track the GitHub push token
+/github_token.txt
